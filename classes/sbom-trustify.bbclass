@@ -170,19 +170,292 @@ def generate_trustify_sbom(d):
             bb.fatal("SBOM_TRUSTIFY_SCOPES not set to 'feed' or 'native'")
 
         bom, skipped = build_bom(rows, f"{machine}-{scope}")
-        if skipped: 
-            bb.plain(f"Skipped recipes: {len(skipped)}")
+        if skipped:
+            bb.note(f"Skipped recipes: {len(skipped)}")
 
         with open(os.path.join(deploy, f"cyclonedx-{scope}.json"), "w") as file:
             json.dump(bom, file, indent=2)
+        bb.note(f"Saved cyclonedx-{scope}.json on {deploy}")
 
-# Run once at the end of any build (world or image), like buildhistory.bbclass.
-# At BuildCompleted all tasks have run, so pkgdata/runtime-reverse and deploy/rpm
-# are fully populated. Enable with INHERIT += "sbom-trustify" in local.conf.
-addhandler sbom_trustify_eventhandler
-sbom_trustify_eventhandler[eventmask] = "bb.event.BuildCompleted"
+def generate_trustify_csaf_vex(d):
+    import json
+    import uuid
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from collections import defaultdict
+    # CVSS v3 base-metric abbreviation -> (CSAF field name, value map).
+    _CVSS3 = {
+        "AV": ("attackVector", {"N": "NETWORK", "A": "ADJACENT_NETWORK", "L": "LOCAL", "P": "PHYSICAL"}),
+        "AC": ("attackComplexity", {"L": "LOW", "H": "HIGH"}),
+        "PR": ("privilegesRequired", {"N": "NONE", "L": "LOW", "H": "HIGH"}),
+        "UI": ("userInteraction", {"N": "NONE", "R": "REQUIRED"}),
+        "S": ("scope", {"U": "UNCHANGED", "C": "CHANGED"}),
+        "C": ("confidentialityImpact", {"N": "NONE", "L": "LOW", "H": "HIGH"}),
+        "I": ("integrityImpact", {"N": "NONE", "L": "LOW", "H": "HIGH"}),
+        "A": ("availabilityImpact", {"N": "NONE", "L": "LOW", "H": "HIGH"}),
+    }
 
-python sbom_trustify_eventhandler() {
-    if e.getFailures() == 0:
-        generate_trustify_sbom(d)
+    # CVSS v2 base-metric abbreviation -> (CSAF field name, value map). NOT the same
+    # as v3: v2 has Au (authentication) with no v3 equivalent, AC has a MEDIUM level,
+    # and the C/I/A impacts are NONE/PARTIAL/COMPLETE instead of NONE/LOW/HIGH.
+    _CVSS2 = {
+        "AV": ("accessVector", {"N": "NETWORK", "A": "ADJACENT_NETWORK", "L": "LOCAL"}),
+        "AC": ("accessComplexity", {"L": "LOW", "M": "MEDIUM", "H": "HIGH"}),
+        "Au": ("authentication", {"M": "MULTIPLE", "S": "SINGLE", "N": "NONE"}),
+        "C": ("confidentialityImpact", {"N": "NONE", "P": "PARTIAL", "C": "COMPLETE"}),
+        "I": ("integrityImpact", {"N": "NONE", "P": "PARTIAL", "C": "COMPLETE"}),
+        "A": ("availabilityImpact", {"N": "NONE", "P": "PARTIAL", "C": "COMPLETE"}),
+    }
+
+    distro = d.getVar("SBOM_TRUSTIFY_DISTRO")
+    deploy = d.getVar("SBOM_TRUSTIFY_DEPLOY")
+    scopes = (d.getVar("SBOM_TRUSTIFY_SCOPES") or "").split()
+    affected_only = d.getVar("SBOM_TRUSTIFY_AFFECTED_ONLY") == "1"
+
+    # Yocto cve-check status -> CSAF product_status bucket.
+    BUCKET = {
+        "Unpatched": "known_affected",
+        "Patched": "fixed",
+        "Ignored": "known_not_affected",
+    }
+    # When the same (recipe, cve) shows up in several per-recipe reports (the
+    # dependency closure overlaps), keep the most severe status.
+    _STATUS_RANK = {"Ignored": 0, "Patched": 1, "Unpatched": 2}
+
+    def severity(score):
+        if score <= 0:
+            return "NONE"
+        elif score < 4:
+            return "LOW"
+        elif score < 7:
+            return "MEDIUM"
+        elif score < 9:
+            return "HIGH"
+        return "CRITICAL"
+
+    def cvss3_object(vector, score_str):
+        """Full CSAF cvss_v3 object parsed from a CVSS:3.x vectorString."""
+        if not vector or not vector.startswith("CVSS:3"):
+            return None
+        parts = vector.split("/")
+        obj = {"version": parts[0].split(":")[1], "vectorString": vector}
+        for part in parts[1:]:
+            k, _, v = part.partition(":")
+            if k in _CVSS3:
+                field, vmap = _CVSS3[k]
+                obj[field] = vmap.get(v, v)
+        score = float(score_str or 0)
+        obj["baseScore"] = score
+        obj["baseSeverity"] = severity(score)
+        return obj
+
+    def cvss2_object(vector, score_str):
+        """Full CSAF cvss_v2 object. A v2 vector has no 'CVSS:' prefix
+        (e.g. AV:N/AC:L/Au:N/C:C/I:C/A:C)."""
+        if not vector or vector.startswith("CVSS:"):
+            return None
+        obj = {"version": "2.0", "vectorString": vector}
+        for part in vector.split("/"):
+            k, _, v = part.partition(":")
+            if k in _CVSS2:
+                field, vmap = _CVSS2[k]
+                obj[field] = vmap.get(v, v)
+        obj["baseScore"] = float(score_str or 0)
+        return obj
+
+    def make_cvss(issue):
+        """Pick the right CVSS object from an issue's primary vectorString.
+        Returns (csaf_field, object) or None. Trustify's CSAF ingest reads
+        cvss_v2 and cvss_v3 but NOT cvss_v4, so v4 vectors are dropped."""
+        vector = issue.get("vectorString") or ""
+        if vector.startswith("CVSS:3"):
+            obj = cvss3_object(vector, issue.get("scorev3"))
+            return ("cvss_v3", obj) if obj else None
+        if vector.startswith("CVSS:4"):
+            return None
+        obj = cvss2_object(vector, issue.get("scorev2"))
+        return ("cvss_v2", obj) if obj else None
+
+    def load_sbom(path):
+        doc = json.loads(Path(path).read_text())
+        comps = []
+        for c in doc.get("components", []):
+            props = {p["name"]: p["value"] for p in c.get("properties", [])}
+            comps.append(
+                {"purl": c["purl"], "name": c["name"], "recipe": props.get("yocto:recipe")}
+            )
+        return comps
+
+    def load_cve_check(paths):
+        """Merge the N per-recipe *.sbom-cve-check.yocto.json reports, deduping
+        each (recipe, cve) and keeping the highest-ranked status."""
+        merged = {}
+        for path in paths:
+            report = json.loads(Path(path).read_text())
+            for entry in report.get("package", []):
+                recipe = merged.setdefault(
+                    entry["name"], {"version": entry.get("version", ""), "issues": {}}
+                )
+                for issue in entry.get("issue", []):
+                    kept = recipe["issues"].get(issue["id"])
+                    if kept is None or (
+                        _STATUS_RANK.get(issue.get("status"), -1)
+                        > _STATUS_RANK.get(kept.get("status"), -1)
+                    ):
+                        recipe["issues"][issue["id"]] = issue
+        return {
+            "package": [
+                {"name": name, "version": rec["version"], "issue": list(rec["issues"].values())}
+                for name, rec in merged.items()
+            ]
+        }
+
+    def build_csaf_vex(sbom_path, cc):
+        comps = load_sbom(sbom_path)
+        recipe_to_idx = defaultdict(list)
+        for i, c in enumerate(comps):
+            if c["recipe"]:
+                recipe_to_idx[c["recipe"]].append(i)
+
+        # cve id -> {buckets: {bucket: set(idx)}, cvss: (field,obj)|None, note, link}
+        cves = {}
+        for entry in cc.get("package", []):
+            idxs = recipe_to_idx.get(entry["name"])
+            if not idxs:
+                continue
+            for issue in entry.get("issue", []):
+                status = issue.get("status")
+                if affected_only and status != "Unpatched":
+                    continue
+                bucket = BUCKET.get(status)
+                if not bucket:
+                    continue
+                rec = cves.setdefault(
+                    issue["id"],
+                    {
+                        "buckets": defaultdict(set),
+                        "cvss": None,
+                        "note": issue.get("summary", ""),
+                        "link": issue.get("link", ""),
+                    },
+                )
+                rec["buckets"][bucket].update(idxs)
+                if rec["cvss"] is None:
+                    rec["cvss"] = make_cvss(issue)
+
+        referenced = sorted(
+            {i for r in cves.values() for s in r["buckets"].values() for i in s}
+        )
+        # product_status / scores reference the COMBINED product id created by the
+        # relationship (distro:comp-N), never the bare leaf comp-N, or Trustify
+        # won't correlate.
+        pid = lambda i: f"distro:comp-{i}"
+
+        leaves = [
+            {
+                "category": "product_name",
+                "name": distro,
+                "product": {
+                    "name": distro,
+                    "product_id": "distro",
+                    "product_identification_helper": {"cpe": f"cpe:/o:{distro}:{distro}"},
+                },
+            }
+        ]
+        rels = []
+        for i in referenced:
+            c = comps[i]
+            leaves.append(
+                {
+                    "category": "product_version",
+                    "name": c["purl"],
+                    "product": {
+                        "name": c["purl"],
+                        "product_id": f"comp-{i}",
+                        # purl taken verbatim from the SBOM so it can't desync.
+                        "product_identification_helper": {"purl": c["purl"]},
+                    },
+                }
+            )
+            rels.append(
+                {
+                    "category": "default_component_of",
+                    "product_reference": f"comp-{i}",
+                    "relates_to_product_reference": "distro",
+                    "full_product_name": {
+                        "name": f"{c['name']} as a component of {distro}",
+                        "product_id": pid(i),
+                    },
+                }
+            )
+
+        vulns = []
+        for cid in sorted(cves):
+            rec = cves[cid]
+            ps = {b: sorted(pid(i) for i in idxs) for b, idxs in rec["buckets"].items()}
+            v = {"cve": cid, "product_status": ps}
+            if rec["cvss"]:
+                field, obj = rec["cvss"]
+                all_ids = sorted({p for ids in ps.values() for p in ids})
+                v["scores"] = [{field: obj, "products": all_ids}]
+            v["notes"] = [{"category": "description", "text": rec["note"] or cid, "title": cid}]
+            if rec["link"]:
+                v["references"] = [{"summary": cid, "url": rec["link"]}]
+            vulns.append(v)
+
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "document": {
+                "category": "csaf_vex",
+                "csaf_version": "2.0",
+                "title": f"Yocto distro VEX for {distro} (sbom-cve-check)",
+                "publisher": {
+                    "category": "vendor",
+                    "name": distro,
+                    "namespace": f"https://example.invalid/{distro}",
+                },
+                "tracking": {
+                    "id": f"YOCTO-VEX-{distro}-{uuid.uuid4().hex[:8]}",
+                    "status": "final",
+                    "version": "1",
+                    "initial_release_date": now,
+                    "current_release_date": now,
+                    "revision_history": [
+                        {"number": "1", "date": now, "summary": "Generated from sbom-cve-check"}
+                    ],
+                    "generator": {"engine": {"name": "sbom-trustify", "version": "0.1"}},
+                },
+            },
+            "product_tree": {
+                "branches": [{"category": "vendor", "name": distro, "branches": leaves}],
+                "relationships": rels,
+            },
+            "vulnerabilities": vulns,
+        }
+
+    # The recipe-scoped cve-check (SBOM_CVE_CHECK_RECIPE_AUTO=1) drops one
+    # <recipe>-recipe-sbom.sbom-cve-check.yocto.json per recipe here.
+    img = Path(d.getVar("DEPLOY_DIR_IMAGE"))
+    cve_files = sorted(img.glob("*.sbom-cve-check.yocto.json"))
+    if not cve_files:
+        bb.warn(
+            "sbom-trustify: no *.sbom-cve-check.yocto.json in %s; skipping CSAF "
+            "(needs SBOM_CVE_CHECK_RECIPE_AUTO=1)" % img
+        )
+        return
+
+    cc = load_cve_check(cve_files)
+    for scope in scopes:
+        sbom_path = Path(deploy) / f"cyclonedx-{scope}.json"
+        if not sbom_path.is_file():
+            bb.warn(f"sbom-trustify: {sbom_path} missing; skipping CSAF for {scope}")
+            continue
+        csaf = build_csaf_vex(str(sbom_path), cc)
+        out = Path(deploy) / f"csaf-vex-{scope}.json"
+        out.write_text(json.dumps(csaf, indent=2))
+        bb.note(f"Saved {out.name} ({len(csaf['vulnerabilities'])} CVEs) on {deploy}")
+
+python do_generate_trustify_sbom() {
+    generate_trustify_sbom(d)
+    generate_trustify_csaf_vex(d)
 }
