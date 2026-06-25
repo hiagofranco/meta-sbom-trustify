@@ -1,17 +1,17 @@
 SBOM_TRUSTIFY_DISTRO ?= "${DISTRO}"
-SBOM_TRUSTIFY_AFFECTED_ONLY ?= "1"
 SBOM_TRUSTIFY_COLLAPSE ?= "linux-yocto"
 SBOM_TRUSTIFY_DEPLOY ?= "${DEPLOY_DIR}/sbom-trustify"
 SBOM_TRUSTIFY_INCLUDE_NONCODE ?= "0"
 SBOM_TRUSTIFY_NONCODE ?= "-dev -dbg -doc -src -staticdev -locale -conf -ptest"
 SBOM_TRUSTIFY_SCOPES ?= "feed native"
+SBOM_TRUSTIFY_AFFECTED_ONLY ?= "1"
 
 def generate_trustify_sbom(d):
     import json
     import os
     import uuid
     from datetime import datetime, timezone
-    from pathlib import Path 
+    from pathlib import Path
 
     def is_code_package(name):
         if "-locale-" in name:
@@ -44,7 +44,7 @@ def generate_trustify_sbom(d):
         rpm_root_path = Path(tmp_path) / "deploy" / "rpm"
         if not rpm_root_path.is_dir():
             bb.fatal(f"deploy/rpm not found it {tmp_path}")
-       
+
         collapse_recipes = (d.getVar("SBOM_TRUSTIFY_COLLAPSE") or "").split()
         # Iterate over arch directories inside rpm folder to get all rpm packages
         seen = {}
@@ -60,7 +60,7 @@ def generate_trustify_sbom(d):
                 pkg_name = rpm.stem.rsplit("-", 2)[0] # get NAME
                 # On runtime-reverse folder, there is a file inside with the
                 # package name, like "runtime-reverse/openssl/". This file contains
-                # the informations about the pakcage, like PN, PB, PR, PKGV...
+                # the informations about the package, like PN, PB, PR, PKGV...
                 rr = runtime_r_path / pkg_name
                 # If for some reason there is no info about the package
                 if not rr.is_file():
@@ -96,7 +96,7 @@ def generate_trustify_sbom(d):
                     # Duplicate version to match the non-native pkgs to be used
                     # to build the sbom
                     natives.append((recipe.name, build_arch, ver.name, ver.name, target))
-        return natives 
+        return natives
 
     def make_purl(distro, name, version, arch):
         return f"pkg:rpm/{distro}/{name}@{version}?arch={arch}"
@@ -110,7 +110,7 @@ def generate_trustify_sbom(d):
             if not include_noncode and not is_code_package(name):
                 skipped.append(name)
                 continue
-            
+
             components.append(
                 {
                     "type": "library",
@@ -146,13 +146,13 @@ def generate_trustify_sbom(d):
                             "name": "feed-to-cyclonedx",
                             "version": "0.1",
                         },
-                    ]    
+                    ]
                 },
             },
             "components": components,
         }
         return bom, skipped
-    
+
     scopes = (d.getVar("SBOM_TRUSTIFY_SCOPES") or '').split()
     if not scopes:
         bb.fatal("SBOM_TRUSTIFY_SCOPES not set, please set as 'feed' or 'native'")
