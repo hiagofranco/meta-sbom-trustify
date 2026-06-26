@@ -46,7 +46,11 @@ the SBOM is still generated and the CSAF step is skipped with a warning.**
    ```
 2. Build the feed (everything you want inventoried):
    ```sh
-   bitbake world          # or an image, e.g. bitbake core-image-minimal
+   bitbake world
+   ```
+3. Generate `world-recipe-sbom.sbom-cve-check.yocto.json`:
+   ```sh
+   bitbake meta-world-recipe-sbom -R conf/distro/include/cve-extra-exclusions.inc -c sbom_cve_check_recipe
    ```
 3. Generate the artifacts (on-demand; the recipe is excluded from `world`):
    ```sh
@@ -73,6 +77,7 @@ All variables can be set in `local.conf`.
 | `SBOM_TRUSTIFY_COLLAPSE` | `linux-yocto` | Recipes whose many packages collapse to one component (the kernel would otherwise add hundreds of module packages) |
 | `SBOM_TRUSTIFY_INCLUDE_NONCODE` | `0` | `1` keeps `-dev`/`-dbg`/`-doc`/`-locale`/… packages |
 | `SBOM_TRUSTIFY_NONCODE` | `-dev -dbg -doc -src -staticdev -locale -conf -ptest` | Suffixes treated as non-code |
+| `SBOM_TRUSTIFY_CVE_REPORT` | `world-recipe-sbom.sbom-cve-check.yocto.json` | Input file |
 
 ## Notes
 

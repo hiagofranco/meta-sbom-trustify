@@ -5,6 +5,7 @@ SBOM_TRUSTIFY_INCLUDE_NONCODE ?= "0"
 SBOM_TRUSTIFY_NONCODE ?= "-dev -dbg -doc -src -staticdev -locale -conf -ptest"
 SBOM_TRUSTIFY_SCOPES ?= "feed native"
 SBOM_TRUSTIFY_AFFECTED_ONLY ?= "1"
+SBOM_TRUSTIFY_CVE_REPORT ?= "world-recipe-sbom.sbom-cve-check.yocto.json"
 
 def generate_trustify_sbom(d):
     import json
@@ -218,10 +219,6 @@ def generate_trustify_csaf_vex(d):
         "Patched": "fixed",
         "Ignored": "known_not_affected",
     }
-    # When the same (recipe, cve) shows up in several per-recipe reports (the
-    # dependency closure overlaps), keep the most severe status.
-    _STATUS_RANK = {"Ignored": 0, "Patched": 1, "Unpatched": 2}
-
     def severity(score):
         if score <= 0:
             return "NONE"
@@ -285,30 +282,6 @@ def generate_trustify_csaf_vex(d):
                 {"purl": c["purl"], "name": c["name"], "recipe": props.get("yocto:recipe")}
             )
         return comps
-
-    def load_cve_check(paths):
-        """Merge the N per-recipe *.sbom-cve-check.yocto.json reports, deduping
-        each (recipe, cve) and keeping the highest-ranked status."""
-        merged = {}
-        for path in paths:
-            report = json.loads(Path(path).read_text())
-            for entry in report.get("package", []):
-                recipe = merged.setdefault(
-                    entry["name"], {"version": entry.get("version", ""), "issues": {}}
-                )
-                for issue in entry.get("issue", []):
-                    kept = recipe["issues"].get(issue["id"])
-                    if kept is None or (
-                        _STATUS_RANK.get(issue.get("status"), -1)
-                        > _STATUS_RANK.get(kept.get("status"), -1)
-                    ):
-                        recipe["issues"][issue["id"]] = issue
-        return {
-            "package": [
-                {"name": name, "version": rec["version"], "issue": list(rec["issues"].values())}
-                for name, rec in merged.items()
-            ]
-        }
 
     def build_csaf_vex(sbom_path, cc):
         comps = load_sbom(sbom_path)
@@ -433,18 +406,21 @@ def generate_trustify_csaf_vex(d):
             "vulnerabilities": vulns,
         }
 
-    # The recipe-scoped cve-check (SBOM_CVE_CHECK_RECIPE_AUTO=1) drops one
-    # <recipe>-recipe-sbom.sbom-cve-check.yocto.json per recipe here.
+    # The world-spanning recipe-scoped cve-check drops a SINGLE report covering
+    # the whole feed, with unique recipe names. Produce it before building this
+    # recipe with:
+    #   bitbake meta-world-recipe-sbom \
+    #           -R conf/distro/include/cve-extra-exclusions.inc \
+    #           -c sbom_cve_check_recipe
     img = Path(d.getVar("DEPLOY_DIR_IMAGE"))
-    cve_files = sorted(img.glob("*.sbom-cve-check.yocto.json"))
-    if not cve_files:
-        bb.warn(
-            "sbom-trustify: no *.sbom-cve-check.yocto.json in %s; skipping CSAF "
-            "(needs SBOM_CVE_CHECK_RECIPE_AUTO=1)" % img
+    cve_report = img / d.getVar("SBOM_TRUSTIFY_CVE_REPORT")
+    if not cve_report.is_file():
+        bb.fatal(
+            f"sbom-trustify: {cve_report.name} not found in {img}; skipping CSAF. "
+            "Run the world recipe cve-check first (see comment above)."
         )
-        return
 
-    cc = load_cve_check(cve_files)
+    cc = json.loads(cve_report.read_text())
     for scope in scopes:
         sbom_path = Path(deploy) / f"cyclonedx-{scope}.json"
         if not sbom_path.is_file():
