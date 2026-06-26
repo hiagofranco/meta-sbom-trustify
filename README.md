@@ -85,3 +85,8 @@ All variables can be set in `local.conf`.
 - The SBOM is recipe/feed-wide and **independent of any image**: `bitbake world`
   is enough; you do not need to build an image first (except for the image-scoped
   CVE fallback noted above).
+
+## AI Assistance Disclosure
+
+Claude Code (Opus 4.8 model) was used to generate this README.md file and to
+generated parts of the function `generate_trustify_csaf_vex()`.
