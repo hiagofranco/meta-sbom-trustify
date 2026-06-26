@@ -12,5 +12,10 @@ INHIBIT_DEFAULT_DEPS = "1"
 # 'image' build.
 EXCLUDE_FROM_WORLD = "1"
 
+# cve-check (inherited globally) wires do_cve_check before do_build on every
+# recipe; this aggregator has no sources to scan, so drop it to avoid pulling
+# in cve-update-nvd2-native.
+deltask do_cve_check
+
 addtask do_generate_trustify_sbom before do_build
 do_generate_trustify_sbom[nostamp] = "1"

@@ -27,16 +27,16 @@ Key properties of the output:
 
 | Requirement | Why |
 |-------------|-----|
-| OpenEmbedded-Core (`core`), branch `wrynose` | Base layer |
+| OpenEmbedded-Core (`core`), branch `scarthgap` | Base layer |
 | `PACKAGE_CLASSES = "package_rpm"` | The SBOM is built from `deploy/rpm` + `pkgdata` |
-| `OE_FRAGMENTS += "core/yocto/sbom-cve-check"` | Enables CVE analysis (CSAF only) |
-| `SBOM_CVE_CHECK_RECIPE_AUTO = "1"` | Runs cve-check per recipe (CSAF only) |
+| `INHERIT += "cve-check"` | Enables CVE analysis (CSAF only) |
 
-The CSAF generator reads the per-recipe `*.sbom-cve-check.yocto.json` files from
-`DEPLOY_DIR_IMAGE`. `SBOM_CVE_CHECK_RECIPE_AUTO` requires the OE-core change that
-wires `do_sbom_cve_check_recipe` before `do_build`; without it, build an image so
-the image-scoped report is produced instead. **If no cve-check report is found,
-the SBOM is still generated and the CSAF step is skipped with a warning.**
+The CSAF generator reads the per-recipe `<PN>_cve.json` files that `cve-check`
+writes under `CVE_CHECK_DIR` (`${DEPLOY_DIR}/cve`). `cve-check` wires
+`do_cve_check` before `do_build`, so a plain `bitbake world` produces one file per
+recipe — no image required. The first run downloads the NVD database via
+`cve-update-nvd2-native`. **If no cve-check report is found, the CSAF step fails
+with a clear message; the SBOM itself is still generated.**
 
 ## Usage
 
@@ -44,13 +44,10 @@ the SBOM is still generated and the CSAF step is skipped with a warning.**
    ```sh
    bitbake-layers add-layer meta-sbom-trustify
    ```
-2. Build the feed (everything you want inventoried):
+2. Build the feed and the per-recipe CVE reports (everything you want
+   inventoried; `do_cve_check` runs as part of the build):
    ```sh
    bitbake world
-   ```
-3. Generate `world-recipe-sbom.sbom-cve-check.yocto.json`:
-   ```sh
-   bitbake meta-world-recipe-sbom -R conf/distro/include/cve-extra-exclusions.inc -c sbom_cve_check_recipe
    ```
 3. Generate the artifacts (on-demand; the recipe is excluded from `world`):
    ```sh
@@ -77,7 +74,8 @@ All variables can be set in `local.conf`.
 | `SBOM_TRUSTIFY_COLLAPSE` | `linux-yocto` | Recipes whose many packages collapse to one component (the kernel would otherwise add hundreds of module packages) |
 | `SBOM_TRUSTIFY_INCLUDE_NONCODE` | `0` | `1` keeps `-dev`/`-dbg`/`-doc`/`-locale`/… packages |
 | `SBOM_TRUSTIFY_NONCODE` | `-dev -dbg -doc -src -staticdev -locale -conf -ptest` | Suffixes treated as non-code |
-| `SBOM_TRUSTIFY_CVE_REPORT` | `world-recipe-sbom.sbom-cve-check.yocto.json` | Input file |
+| `SBOM_TRUSTIFY_CVE_DIR` | `${DEPLOY_DIR}/cve` | Where cve-check drops per-recipe reports |
+| `SBOM_TRUSTIFY_CVE_GLOB` | `*_cve.json` | Per-recipe cve-check report glob |
 
 ## Notes
 
@@ -88,8 +86,8 @@ All variables can be set in `local.conf`.
   Trustify ingests and surfaces **CVSS v3** (`cvss3_scores`); CVSS v4 vectors and
   CVEs with no score in the source are listed without a score.
 - The SBOM is recipe/feed-wide and **independent of any image**: `bitbake world`
-  is enough; you do not need to build an image first (except for the image-scoped
-  CVE fallback noted above).
+  is enough; you do not need to build an image first. `cve-check` runs per recipe
+  during the world build, so the CSAF covers the whole feed (not just an image).
 
 ## AI Assistance Disclosure
 

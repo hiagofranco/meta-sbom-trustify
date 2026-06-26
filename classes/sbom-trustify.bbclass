@@ -5,7 +5,11 @@ SBOM_TRUSTIFY_INCLUDE_NONCODE ?= "0"
 SBOM_TRUSTIFY_NONCODE ?= "-dev -dbg -doc -src -staticdev -locale -conf -ptest"
 SBOM_TRUSTIFY_SCOPES ?= "feed native"
 SBOM_TRUSTIFY_AFFECTED_ONLY ?= "1"
-SBOM_TRUSTIFY_CVE_REPORT ?= "world-recipe-sbom.sbom-cve-check.yocto.json"
+# Scarthgap cve-check writes one <PN>_cve.json per recipe under CVE_CHECK_DIR
+# (${DEPLOY_DIR}/cve). We glob+merge them all (the report recipe does not
+# inherit cve-check, so default to the path instead of ${CVE_CHECK_DIR}).
+SBOM_TRUSTIFY_CVE_DIR ?= "${DEPLOY_DIR}/cve"
+SBOM_TRUSTIFY_CVE_GLOB ?= "*_cve.json"
 
 def generate_trustify_sbom(d):
     import json
@@ -406,21 +410,24 @@ def generate_trustify_csaf_vex(d):
             "vulnerabilities": vulns,
         }
 
-    # The world-spanning recipe-scoped cve-check drops a SINGLE report covering
-    # the whole feed, with unique recipe names. Produce it before building this
-    # recipe with:
-    #   bitbake meta-world-recipe-sbom \
-    #           -R conf/distro/include/cve-extra-exclusions.inc \
-    #           -c sbom_cve_check_recipe
-    img = Path(d.getVar("DEPLOY_DIR_IMAGE"))
-    cve_report = img / d.getVar("SBOM_TRUSTIFY_CVE_REPORT")
-    if not cve_report.is_file():
+    # Scarthgap cve-check (INHERIT += "cve-check") drops one <PN>_cve.json per
+    # recipe under CVE_CHECK_DIR. do_cve_check is wired before do_build, so a
+    # normal world build produces the whole feed:
+    #   bitbake world          (or, to force: bitbake world -k -c cve_check)
+    cve_dir = Path(d.getVar("SBOM_TRUSTIFY_CVE_DIR"))
+    cve_glob = d.getVar("SBOM_TRUSTIFY_CVE_GLOB")
+    cve_files = sorted(cve_dir.glob(cve_glob))
+    if not cve_files:
         bb.fatal(
-            f"sbom-trustify: {cve_report.name} not found in {img}; skipping CSAF. "
-            "Run the world recipe cve-check first (see comment above)."
+            f"sbom-trustify: no {cve_glob} under {cve_dir}; run the cve-check "
+            "first (INHERIT += \"cve-check\"; bitbake world)."
         )
 
-    cc = json.loads(cve_report.read_text())
+    # Each per-recipe report covers only its own recipe (no dependency-closure
+    # overlap), so a plain union of the package lists is enough.
+    cc = {"package": []}
+    for f in cve_files:
+        cc["package"].extend(json.loads(f.read_text()).get("package", []))
     for scope in scopes:
         sbom_path = Path(deploy) / f"cyclonedx-{scope}.json"
         if not sbom_path.is_file():
