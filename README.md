@@ -94,4 +94,5 @@ All variables can be set in `local.conf`.
 ## AI Assistance Disclosure
 
 Claude Code (Opus 4.8 model) was used to generate this README.md file and to
-generated parts of the function `generate_trustify_csaf_vex()`.
+generated parts of the function `generate_trustify_csaf_vex()` and parts of the
+function `generate_guac_cyclonedx()`.
