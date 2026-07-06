@@ -438,7 +438,94 @@ def generate_trustify_csaf_vex(d):
         out.write_text(json.dumps(csaf, indent=2))
         bb.note(f"Saved {out.name} ({len(csaf['vulnerabilities'])} CVEs) on {deploy}")
 
+def generate_guac_cyclonedx(d):
+    import json
+    from pathlib import Path
+
+    deploy = Path(d.getVar("SBOM_TRUSTIFY_DEPLOY"))
+    scopes = (d.getVar("SBOM_TRUSTIFY_SCOPES") or "").split()
+
+    STATE = {
+        "known_affected": "exploitable",
+        "fixed": "resolved",
+        "known_not_affected": "not_affected",
+    }
+
+    def cdx_rating(score):
+        for field, method in (("cvss_v3", "CVSSv3"), ("cvss_v2", "CVSSv2")):
+            obj = score.get(field)
+            if obj:
+                r = {"method": method, "score": obj.get("baseScore"),
+                     "vector": obj.get("vectorString")}
+                if obj.get("baseSeverity"):
+                    r["severity"] = obj["baseSeverity"].lower()
+                return r
+        return None
+
+    def build_guac_bom(sbom, csaf):
+        # purl -> bom-ref for every SBOM component; the GUAC doc keeps the full
+        # component list so the dependency graph rides along with the vulns.
+        purl_to_ref = {c["purl"]: c["bom-ref"] for c in sbom.get("components", [])}
+
+        leaf_ref = {}
+        for vendor in csaf["product_tree"]["branches"]:
+            for leaf in vendor.get("branches", []):
+                if leaf["category"] != "product_version":
+                    continue
+                helper = leaf["product"].get("product_identification_helper", {})
+                ref = purl_to_ref.get(helper.get("purl"))
+                if ref:
+                    leaf_ref[leaf["product"]["product_id"]] = ref
+        pid_to_ref = {
+            rel["full_product_name"]["product_id"]: leaf_ref[rel["product_reference"]]
+            for rel in csaf["product_tree"].get("relationships", [])
+            if rel["product_reference"] in leaf_ref
+        }
+
+        vulns = []
+        for v in csaf.get("vulnerabilities", []):
+            cid = v["cve"]
+            # Returns and empty dict in case of fail (= returns None)
+            rating = cdx_rating((v.get("scores") or [{}])[0])
+            link = (v.get("references") or [{}])[0].get("url")
+            for bucket, pids in v.get("product_status", {}).items():
+                state = STATE.get(bucket)
+                if not state:
+                    continue
+                refs = [{"ref": pid_to_ref[pid]} for pid in pids if pid in pid_to_ref]
+                if not refs:
+                    continue
+                vuln = {
+                    "bom-ref": f"{cid}-{bucket}",
+                    "id": cid,
+                    "source": {"name": "NVD", "url": link} if link else {"name": "NVD"},
+                    "analysis": {"state": state},
+                    "affects": refs,
+                }
+                if rating:
+                    vuln["ratings"] = [rating]
+                vulns.append(vuln)
+
+        out = dict(sbom)
+        out["vulnerabilities"] = vulns
+        return out
+
+    for scope in scopes:
+        sbom_path = deploy / f"cyclonedx-{scope}.json"
+        csaf_path = deploy / f"csaf-vex-{scope}.json"
+        if not (sbom_path.is_file() and csaf_path.is_file()):
+            bb.warn(f"sbom-trustify: missing {scope} inputs; skipping GUAC bom")
+            continue
+        bom = build_guac_bom(
+            json.loads(sbom_path.read_text()),
+            json.loads(csaf_path.read_text()),
+        )
+        out = deploy / f"cyclonedx-guac-{scope}.json"
+        out.write_text(json.dumps(bom, indent=2))
+        bb.note(f"Saved {out.name} ({len(bom['vulnerabilities'])} VEX entries) on {deploy}")
+
 python do_generate_trustify_sbom() {
     generate_trustify_sbom(d)
     generate_trustify_csaf_vex(d)
+    generate_guac_cyclonedx(d)
 }
